@@ -1,0 +1,1144 @@
+import os
+import numpy as np
+import cv2
+import csv
+from glob import glob
+import torch
+import matplotlib.pyplot as plt
+import gc
+import sys
+from pathlib import Path
+from pathlib import Path
+import argparse
+
+from utils import (
+    create_query_list_with_intrinsics, scale_sfm_images, evaluate)
+from hloc import extract_features, match_features, pairs_from_covisibility
+from hloc import triangulation, localize_sfm, pairs_from_retrieval, logger
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+import kornia
+import kornia as K
+import kornia.feature as KF
+import kornia_moons.feature as KMF
+
+
+###
+from tqdm import tqdm
+import numpy as np
+import h5py
+import torch
+from pathlib import Path
+from typing import Dict, Iterable, Optional, List, Tuple, Union, Set
+import pprint
+import argparse
+import torchvision.transforms.functional as F
+from types import SimpleNamespace
+from collections import defaultdict
+from scipy.spatial import KDTree
+from collections import Counter
+from itertools import chain
+
+from hloc import matchers, logger
+from hloc.utils.base_model import dynamic_load
+from hloc.utils.parsers import parse_retrieval, names_to_pair
+from hloc.match_features import find_unique_new_pairs
+from hloc.extract_features import read_image,resize_image
+from hloc.utils.io import list_h5_names
+
+
+
+#loftr
+
+class LoFTRMatcher:
+    def __init__(self, device=None):
+        self._loftr_matcher = KF.LoFTR(pretrained=None)
+        self._loftr_matcher.load_state_dict(torch.load("/home/ljy/download/koria/loftr_outdoor.ckpt")['state_dict'])
+        self._loftr_matcher = self._loftr_matcher.to(device).eval()
+        self.device = device
+
+    def prep_img(self, img):
+        img_ts = K.image_to_tensor(img, False).float() / 255.
+        img_ts = K.color.bgr_to_rgb(img_ts)
+        img_ts = K.color.rgb_to_grayscale(img_ts)
+        return img_ts.to(self.device)
+
+    def tta_rotation_preprocess(self, img_np, angle):
+        rot_M = cv2.getRotationMatrix2D((img_np.shape[1] / 2, img_np.shape[0] / 2), angle, 1)
+        rot_M_inv = cv2.getRotationMatrix2D((img_np.shape[1] / 2, img_np.shape[0] / 2), -angle, 1)
+        rot_img = cv2.warpAffine(img_np, rot_M, (img_np.shape[1], img_np.shape[0]))
+
+        rot_img_ts = K.image_to_tensor(rot_img, False).float() / 255.
+        rot_img_ts = K.color.bgr_to_rgb(rot_img_ts)
+        rot_img_ts = K.color.rgb_to_grayscale(rot_img_ts)
+        return rot_M, rot_img_ts.to(self.device), rot_M_inv
+
+    def tta_rotation_postprocess(self, kpts, img_np, rot_M_inv):
+        ones = np.ones(shape=(kpts.shape[0],), dtype=np.float32)[:, None]
+        hom = np.concatenate([kpts, ones], 1)
+        rot_kpts = rot_M_inv.dot(hom.T).T[:, :2]
+        mask = (rot_kpts[:, 0] >= 0) & (rot_kpts[:, 0] < img_np.shape[1]) & (rot_kpts[:, 1] >= 0) & (
+                    rot_kpts[:, 1] < img_np.shape[0])
+        return rot_kpts, mask
+
+    def __call__(self, img_np1, img_np2, tta=['orig'], conf_th=None):
+        with torch.no_grad():
+            img_ts0 = self.prep_img(img_np1)
+            img_ts1 = self.prep_img(img_np2)
+            images0, images1 = [], []
+
+            # TTA
+            for tta_elem in tta:
+                if tta_elem == 'orig':
+                    img_ts0_aug, img_ts1_aug = img_ts0, img_ts1
+                elif tta_elem == 'flip_lr':
+                    img_ts0_aug = torch.flip(img_ts0, [3, ])
+                    img_ts1_aug = torch.flip(img_ts1, [3, ])
+                elif tta_elem == 'flip_ud':
+                    img_ts0_aug = torch.flip(img_ts0, [2, ])
+                    img_ts1_aug = torch.flip(img_ts1, [2, ])
+                elif tta_elem == 'rot_r10':
+                    rot_r10_M0, img_ts0_aug, rot_r10_M0_inv = self.tta_rotation_preprocess(img_np1, 10)
+                    rot_r10_M1, img_ts1_aug, rot_r10_M1_inv = self.tta_rotation_preprocess(img_np2, 10)
+                elif tta_elem == 'rot_l10':
+                    rot_l10_M0, img_ts0_aug, rot_l10_M0_inv = self.tta_rotation_preprocess(img_np1, -10)
+                    rot_l10_M1, img_ts1_aug, rot_l10_M1_inv = self.tta_rotation_preprocess(img_np2, -10)
+                else:
+                    raise ValueError('Unknown TTA method.')
+                images0.append(img_ts0_aug)
+                images1.append(img_ts1_aug)
+
+            # Inference
+            input_dict = {"image0": torch.cat(images0), "image1": torch.cat(images1)}
+            correspondences = self._loftr_matcher(input_dict)
+            mkpts0 = correspondences['keypoints0'].cpu().numpy()
+            mkpts1 = correspondences['keypoints1'].cpu().numpy()
+            batch_id = correspondences['batch_indexes'].cpu().numpy()
+            confidence = correspondences['confidence'].cpu().numpy()
+
+            # Reverse TTA
+            for idx, tta_elem in enumerate(tta):
+                batch_mask = batch_id == idx
+
+                if tta_elem == 'orig':
+                    pass
+                elif tta_elem == 'flip_lr':
+                    mkpts0[batch_mask, 0] = img_np1.shape[1] - mkpts0[batch_mask, 0]
+                    mkpts1[batch_mask, 0] = img_np2.shape[1] - mkpts1[batch_mask, 0]
+                elif tta_elem == 'flip_ud':
+                    mkpts0[batch_mask, 1] = img_np1.shape[0] - mkpts0[batch_mask, 1]
+                    mkpts1[batch_mask, 1] = img_np2.shape[0] - mkpts1[batch_mask, 1]
+                elif tta_elem == 'rot_r10':
+                    mkpts0[batch_mask], mask0 = self.tta_rotation_postprocess(mkpts0[batch_mask], img_np1,
+                                                                              rot_r10_M0_inv)
+                    mkpts1[batch_mask], mask1 = self.tta_rotation_postprocess(mkpts1[batch_mask], img_np2,
+                                                                              rot_r10_M1_inv)
+                    confidence[batch_mask] += (~(mask0 & mask1)).astype(np.float32) * -10.
+                elif tta_elem == 'rot_l10':
+                    mkpts0[batch_mask], mask0 = self.tta_rotation_postprocess(mkpts0[batch_mask], img_np1,
+                                                                              rot_l10_M0_inv)
+                    mkpts1[batch_mask], mask1 = self.tta_rotation_postprocess(mkpts1[batch_mask], img_np2,
+                                                                              rot_l10_M1_inv)
+                    confidence[batch_mask] += (~(mask0 & mask1)).astype(np.float32) * -10.
+                else:
+                    raise ValueError('Unknown TTA method.')
+
+            if conf_th is not None:
+                th_mask = confidence >= conf_th
+            else:
+                th_mask = confidence >= 0.
+            mkpts0, mkpts1 = mkpts0[th_mask, :], mkpts1[th_mask, :]
+
+            # Matching points
+            return mkpts0, mkpts1
+            #return mkpts0, mkpts1, confidence
+#################################################################################################loftr
+
+#superglue
+
+sys.path.append(str(Path(__file__).parent / '../../../third_party'))
+from SuperGluePretrainedNetwork.models.superpoint import SuperPoint# noqa E402
+from SuperGluePretrainedNetwork.models.superglue import SuperGlue
+
+class SuperGlueCustomMatching(torch.nn.Module):
+    """ Image Matching Frontend (SuperPoint + SuperGlue) """
+
+    def __init__(self, config={}):
+        super().__init__()
+        self.superpoint = SuperPoint(config.get('superpoint', {}))
+        self.superglue = SuperGlue(config.get('superglue', {}))
+
+    def forward(self, data):
+        """ Run SuperPoint (optionally) and SuperGlue
+        SuperPoint is skipped if ['keypoints0', 'keypoints1'] exist in input
+        Args:
+          data: dictionary with minimal keys: ['image0', 'image1']
+        """
+
+        pred = {}
+
+        # Extract SuperPoint (keypoints, scores, descriptors) if not provided
+        if 'keypoints0' not in data:
+            pred0 = self.superpoint({'image': data['image0']})
+            pred = {**pred, **{k + '0': v for k, v in pred0.items()}}
+        if 'keypoints1' not in data:
+            pred1 = self.superpoint({'image': data['image1']})
+            pred = {**pred, **{k + '1': v for k, v in pred1.items()}}
+
+        # Batch all features
+        # We should either have i) one image per batch, or
+        # ii) the same number of local features for all images in the batch.
+        data = {**data, **pred}
+
+        pred_list = []
+        for i in range(data['image0'].shape[0]):
+            ith_data = {k: v[i:i + 1] for k, v in data.items()}
+            for k in ith_data:
+                if isinstance(ith_data[k], (list, tuple)):
+                    ith_data[k] = torch.stack(ith_data[k])
+            ith_pred = {
+                **{k: v[i] for k, v in pred.items()},
+                **self.superglue(ith_data)
+            }
+            pred_list.append(ith_pred)
+        return {k: [p[k] for p in pred_list] for k in ith_pred}
+
+
+class SuperGlueMatcher:
+    def __init__(self, device=None):
+        config = {
+            "superpoint": {
+                "nms_radius": 4,
+                "keypoint_threshold": 0.005,
+                "max_keypoints": 1024
+            },
+            "superglue": {
+                "weights": "outdoor",
+                "sinkhorn_iterations": 100,
+                "match_threshold": 0.2,
+            }
+        }
+        self.device = device
+        self._superglue_matcher = SuperGlueCustomMatching(config).eval().to(device)
+
+        # utils
+        self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+    def prep_np_img(self, img):
+        return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    def frame2tensor(self, frame):
+        return (torch.from_numpy(frame).float() / 255.)[None, None].to(self.device)
+
+    def tta_rotation_preprocess(self, img_np, angle):
+        rot_M = cv2.getRotationMatrix2D((img_np.shape[1] / 2, img_np.shape[0] / 2), angle, 1)
+        rot_M_inv = cv2.getRotationMatrix2D((img_np.shape[1] / 2, img_np.shape[0] / 2), -angle, 1)
+        rot_img = self.frame2tensor(cv2.warpAffine(img_np, rot_M, (img_np.shape[1], img_np.shape[0])))
+        return rot_M, rot_img, rot_M_inv
+
+    def tta_rotation_postprocess(self, kpts, img_np, rot_M_inv):
+        ones = np.ones(shape=(kpts.shape[0],), dtype=np.float32)[:, None]
+        hom = np.concatenate([kpts, ones], 1)
+        rot_kpts = rot_M_inv.dot(hom.T).T[:, :2]
+        mask = (rot_kpts[:, 0] >= 0) & (rot_kpts[:, 0] < img_np.shape[1]) & (rot_kpts[:, 1] >= 0) & (
+                    rot_kpts[:, 1] < img_np.shape[0])
+        return rot_kpts, mask
+
+    def __call__(self, img_np0, img_np1, tta=['orig'], conf_th=None):
+        with torch.no_grad():
+            img_np0 = self.prep_np_img(img_np0)
+            img_np1 = self.prep_np_img(img_np1)
+
+            img_ts0 = self.frame2tensor(img_np0)
+            img_ts1 = self.frame2tensor(img_np1)
+            images0, images1 = [], []
+
+            # TTA
+            for tta_elem in tta:
+                if tta_elem == 'orig':
+                    img_ts0_aug, img_ts1_aug = img_ts0, img_ts1
+                elif tta_elem == 'flip_lr':
+                    img_ts0_aug = torch.flip(img_ts0, [3, ])
+                    img_ts1_aug = torch.flip(img_ts1, [3, ])
+                elif tta_elem == 'flip_ud':
+                    img_ts0_aug = torch.flip(img_ts0, [2, ])
+                    img_ts1_aug = torch.flip(img_ts1, [2, ])
+                elif tta_elem == 'rot_r10':
+                    rot_r10_M0, img_ts0_aug, rot_r10_M0_inv = self.tta_rotation_preprocess(img_np0, 10)
+                    rot_r10_M1, img_ts1_aug, rot_r10_M1_inv = self.tta_rotation_preprocess(img_np1, 10)
+                elif tta_elem == 'rot_l10':
+                    rot_l10_M0, img_ts0_aug, rot_l10_M0_inv = self.tta_rotation_preprocess(img_np0, -10)
+                    rot_l10_M1, img_ts1_aug, rot_l10_M1_inv = self.tta_rotation_preprocess(img_np1, -10)
+                elif tta_elem == 'eqhist':
+                    img_ts0_aug = self.frame2tensor(cv2.equalizeHist(img_np0))
+                    img_ts1_aug = self.frame2tensor(cv2.equalizeHist(img_np1))
+                elif tta_elem == 'clahe':
+                    img_ts0_aug = self.frame2tensor(self._clahe.apply(img_np0))
+                    img_ts1_aug = self.frame2tensor(self._clahe.apply(img_np1))
+                else:
+                    raise ValueError('Unknown TTA method.')
+
+                images0.append(img_ts0_aug)
+                images1.append(img_ts1_aug)
+
+            # Inference
+            pred = self._superglue_matcher({
+                "image0": torch.cat(images0),
+                "image1": torch.cat(images1)})
+
+            # Reverse TTA
+            mkpts0, mkpts1, mconf = [], [], []
+            for idx, tta_elem in enumerate(tta):
+                pred_aug = {k: v[idx].detach().cpu().numpy().squeeze() for k, v in pred.items()}
+                kpts0, kpts1 = pred_aug["keypoints0"], pred_aug["keypoints1"]
+                matches, conf = pred_aug["matches0"], pred_aug["matching_scores0"]
+
+                if conf_th is None:
+                    valid = matches > -1
+                else:
+                    valid = (matches > -1) & (conf >= conf_th)
+                aug_mkpts0 = kpts0[valid]
+                aug_mkpts1 = kpts1[matches[valid]]
+                mconf.append(conf[valid])
+
+                if tta_elem in {'orig', 'eqhist', 'clahe'}:
+                    pass
+                elif tta_elem == 'flip_lr':
+                    aug_mkpts0[:, 0] = img_np0.shape[1] - aug_mkpts0[:, 0]
+                    aug_mkpts1[:, 0] = img_np1.shape[1] - aug_mkpts1[:, 0]
+                elif tta_elem == 'flip_ud':
+                    aug_mkpts0[:, 1] = img_np0.shape[0] - aug_mkpts0[:, 1]
+                    aug_mkpts1[:, 1] = img_np1.shape[0] - aug_mkpts1[:, 1]
+                elif tta_elem == 'rot_r10':
+                    aug_mkpts0, mask0 = self.tta_rotation_postprocess(aug_mkpts0, img_np0, rot_r10_M0_inv)
+                    aug_mkpts1, mask1 = self.tta_rotation_postprocess(aug_mkpts1, img_np1, rot_r10_M1_inv)
+                    aug_mkpts0, aug_mkpts1 = aug_mkpts0[mask0 & mask1], aug_mkpts1[mask0 & mask1]
+                elif tta_elem == 'rot_l10':
+                    aug_mkpts0, mask0 = self.tta_rotation_postprocess(aug_mkpts0, img_np0, rot_l10_M0_inv)
+                    aug_mkpts1, mask1 = self.tta_rotation_postprocess(aug_mkpts1, img_np1, rot_l10_M1_inv)
+                    aug_mkpts0, aug_mkpts1 = aug_mkpts0[mask0 & mask1], aug_mkpts1[mask0 & mask1]
+                else:
+                    raise ValueError('Unknown TTA method.')
+
+                mkpts0.append(aug_mkpts0)
+                mkpts1.append(aug_mkpts1)
+
+            # Matching points
+            return np.concatenate(mkpts0), np.concatenate(mkpts1)
+            # return np.concatenate(mkpts0), np.concatenate(mkpts1),conf
+
+
+########################################  SG  #################################################################################
+
+#dkm
+
+import numpy as np # linear algebra
+import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
+import sys, os, csv
+from PIL import Image
+import cv2, gc
+import matplotlib.pyplot as plt
+import torch
+import types
+import torch.nn.functional as TorchFunc
+
+sys.path.append('/home/ljy/download/DKM')
+
+from dkm import dkm_base
+from torchvision import transforms
+
+
+def custom_stable_neighbours(self, query_coords, query_to_support, support_to_query):
+    qts = query_to_support
+    for t in range(4):
+        _qts = qts
+        q = TorchFunc.grid_sample(support_to_query, qts, mode="bilinear")
+        qts = TorchFunc.grid_sample(
+            query_to_support.permute(0, 3, 1, 2),
+            q.permute(0, 2, 3, 1),
+            mode="bilinear",
+        ).permute(0, 2, 3, 1)
+    d = (qts - _qts).norm(dim=-1)
+    qd = (q - query_coords).norm(dim=1)
+    stabneigh = torch.logical_and(d < 1e-3, qd < 5e-3)
+    return q, qts, stabneigh
+
+
+def custom_match(
+        self,
+        im1,
+        im2,
+        batched=False,
+        check_cycle_consistency=False,
+        do_pred_in_og_res=False,
+):
+    self.train(False)
+    with torch.no_grad():
+        if not batched:
+            b = 1
+            w, h = im1.size
+            w2, h2 = im2.size
+            # Get images in good format
+            ws = self.w_resized
+            hs = self.h_resized
+            test_transform = get_tuple_transform_ops(
+                resize=(hs, ws), normalize=True
+            )
+            query, support = test_transform((im1, im2))
+            batch = {"query": query[None].cuda(), "support": support[None].cuda()}
+        else:
+            b, c, h, w = im1.shape
+            b, c, h2, w2 = im2.shape
+            assert w == w2 and h == h2, "wat"
+            batch = {"query": im1.cuda(), "support": im2.cuda()}
+            hs, ws = self.h_resized, self.w_resized
+        finest_scale = 1  # i will assume that we go to the finest scale (otherwise min(list(dense_corresps.keys())) also works)
+        # Run matcher
+        if check_cycle_consistency:
+            dense_corresps = self.forward_symmetric(batch)
+            query_to_support, support_to_query = dense_corresps[finest_scale][
+                "dense_flow"
+            ].chunk(2)
+            query_to_support = query_to_support.permute(0, 2, 3, 1)
+            dense_certainty, dc_s = dense_corresps[finest_scale][
+                "dense_certainty"
+            ].chunk(
+                2
+            )  # TODO: Here we could also use the reverse certainty
+        else:
+            dense_corresps = self.forward(batch)
+            query_to_support = dense_corresps[finest_scale]["dense_flow"].permute(
+                0, 2, 3, 1
+            )
+            # Get certainty interpolation
+            dense_certainty = dense_corresps[finest_scale]["dense_certainty"]
+
+        if do_pred_in_og_res:  # Will assume that there is no batching going on.
+            og_query, og_support = self.og_transforms((im1, im2))
+            query_to_support, dense_certainty = self.decoder.upsample_preds(
+                query_to_support,
+                dense_certainty,
+                og_query.cuda()[None],
+                og_support.cuda()[None],
+            )
+            hs, ws = h, w
+        # Create im1 meshgrid
+        query_coords = torch.meshgrid(
+            (
+                torch.linspace(-1 + 1 / hs, 1 - 1 / hs, hs, device="cuda:0"),
+                torch.linspace(-1 + 1 / ws, 1 - 1 / ws, ws, device="cuda:0"),
+            )
+        )
+        query_coords = torch.stack((query_coords[1], query_coords[0]))
+        query_coords = query_coords[None].expand(b, 2, hs, ws)
+        dense_certainty = dense_certainty.sigmoid()  # logits -> probs
+        if check_cycle_consistency:
+            query_coords, query_to_support, stabneigh = self.custom_stable_neighbours(
+                query_coords, query_to_support, support_to_query
+            )
+            dense_certainty *= stabneigh[:, None, :, :].float() + 1e-3
+        # Return only matches better than threshold
+        query_coords = query_coords.permute(0, 2, 3, 1)
+
+        query_to_support = torch.clamp(query_to_support, -1, 1)
+        if batched:
+            return torch.cat((query_coords, query_to_support), dim=-1), dense_certainty[:, 0]
+        else:
+            return torch.cat((query_coords, query_to_support), dim=-1)[0], dense_certainty[0, 0]
+
+
+class DKMMatcher:
+    _DEFAULT_CONFIG = {
+        'w': 512, 'h': 384,
+        'thresh': {
+            'method': 'abs_rnd',
+            'th': 0.9,
+            'take': 100,
+        }
+    }
+
+    def __init__(self, device=None, config=_DEFAULT_CONFIG):
+        torch.hub.set_dir('/kaggle/working/pretrained/')
+        self._dkm_matcher = dkm_base(pretrained=True, version="v11").to(device).eval()
+        self.config = config
+        self._dkm_matcher.w_resized = config['w']
+        self._dkm_matcher.h_resized = config['h']
+        self._dkm_matcher.custom_stable_neighbours = types.MethodType(custom_stable_neighbours, self._dkm_matcher)
+        self._dkm_matcher.custom_match = types.MethodType(custom_match, self._dkm_matcher)
+        self.device = device
+
+        mean = [0.485, 0.456, 0.406]
+        std = [0.229, 0.224, 0.225]
+        self.normalize = transforms.Normalize(mean=mean, std=std)
+
+    def prepare_torch_image(self, img):
+        """img - BGR image array"""
+        img_ts = K.image_to_tensor(img, False).float() / 255.
+        img_ts = K.color.bgr_to_rgb(img_ts)
+        return self.normalize(img_ts)
+
+    def results_thresholding(self, dense_matches, dense_certainty):
+        if self.config['thresh']['method'] == 'abs_rnd':
+            n_take = (dense_certainty >= self.config['thresh']['th']).count_nonzero().cpu().numpy()
+            n_take = min(max(n_take, 0), self.config['thresh']['take'])
+            sparse_matches, sparse_certainty = self._dkm_matcher.sample(dense_matches, dense_certainty, num=n_take)
+        elif self.config['thresh']['method'] == 'rel':
+            sparse_matches, sparse_certainty = self._dkm_matcher.sample(
+                dense_matches, dense_certainty,
+                num=self.config['thresh']['take'], relative_confidence_threshold=self.config['thresh']['th'])
+        elif self.config['thresh']['method'] == 'abs':
+            matches, certainty = (
+                dense_matches.reshape(-1, 4),
+                dense_certainty.reshape(-1),
+            )
+            th_matches, th_certainty = (
+                matches[certainty > self.config['thresh']['th']].cpu().numpy(),
+                certainty[certainty > self.config['thresh']['th']].cpu().numpy(),
+            )
+            if len(th_matches) > 0:
+                good_samples = np.random.choice(
+                    np.arange(len(th_matches)),
+                    size=min(self.config['thresh']['take'], len(th_certainty)),
+                    replace=False,
+                    p=th_certainty / (np.sum(th_certainty) + 1e-6),
+                )
+                sparse_matches = th_matches[good_samples]
+            else:
+                sparse_matches = th_matches
+        else:
+            raise ValueError('Unknown thresholding method ' + str(self.config['thresh']['method']))
+        #return sparse_matches,th_certainty
+        return sparse_matches
+
+    def tta_rotation_preprocess(self, img_np, angle):
+        rot_M = cv2.getRotationMatrix2D((img_np.shape[1] / 2, img_np.shape[0] / 2), angle, 1)
+        rot_M_inv = cv2.getRotationMatrix2D((img_np.shape[1] / 2, img_np.shape[0] / 2), -angle, 1)
+        rot_img = cv2.warpAffine(img_np, rot_M, (img_np.shape[1], img_np.shape[0]))
+        return rot_M, rot_img, rot_M_inv
+
+    def tta_rotation_postprocess(self, kpts, img_np, rot_M_inv):
+        ones = np.ones(shape=(kpts.shape[0],), dtype=np.float32)[:, None]
+        hom = np.concatenate([kpts, ones], 1)
+        rot_kpts = rot_M_inv.dot(hom.T).T[:, :2]
+        mask = (rot_kpts[:, 0] >= 0) & (rot_kpts[:, 0] < img_np.shape[1]) & (rot_kpts[:, 1] >= 0) & (
+                    rot_kpts[:, 1] < img_np.shape[0])
+        return rot_kpts, mask
+
+    def __call__(self, img_bgr_np1, img_bgr_np2, tta=['orig'], verbose=0):
+        with torch.no_grad():
+            # TTA preparation. Affine first, and rotation only after
+            ttaprep_st = time.time()
+            images0, images1 = [], []
+            for tta_elem in tta:
+                if tta_elem == 'orig':
+                    img_np0_aug, img_np1_aug = img_bgr_np1, img_bgr_np2
+                elif tta_elem == 'flip_lr':
+                    img_np0_aug = np.flip(img_bgr_np1, [1, ]).copy()
+                    img_np1_aug = np.flip(img_bgr_np2, [1, ]).copy()
+                elif tta_elem == 'flip_ud':
+                    img_np0_aug = np.flip(img_bgr_np1, [0, ]).copy()
+                    img_np1_aug = np.flip(img_bgr_np2, [0, ]).copy()
+                elif tta_elem == 'rot_r10':
+                    rot_r10_M0, img_np0_aug, rot_r10_M0_inv = self.tta_rotation_preprocess(img_bgr_np1, 10)
+                    rot_r10_M1, img_np1_aug, rot_r10_M1_inv = self.tta_rotation_preprocess(img_bgr_np2, 10)
+                elif tta_elem == 'rot_l10':
+                    rot_l10_M0, img_np0_aug, rot_l10_M0_inv = self.tta_rotation_preprocess(img_bgr_np1, -10)
+                    rot_l10_M1, img_np1_aug, rot_l10_M1_inv = self.tta_rotation_preprocess(img_bgr_np2, -10)
+                else:
+                    raise ValueError('Unknown TTA method.')
+
+                # Rotation is after for 2 reasons:
+                #   - I think rotation on smaller scale might lose some information
+                #   - Avoid any weird stuff in combining affine transformations
+                img_np0_aug = cv2.resize(img_np0_aug, (self._dkm_matcher.w_resized, self._dkm_matcher.h_resized))
+                img_np1_aug = cv2.resize(img_np1_aug, (self._dkm_matcher.w_resized, self._dkm_matcher.h_resized))
+                images0.append(self.prepare_torch_image(img_np0_aug))
+                images1.append(self.prepare_torch_image(img_np1_aug))
+            ttaprep_nd = time.time()
+
+            # Batched inference
+            batchinf_st = time.time()  # -- start
+            img0_batch_ts, img1_batch_ts = torch.cat(images0), torch.cat(images1)
+            dense_matches, dense_certainty = self._dkm_matcher.custom_match(
+                img0_batch_ts, img1_batch_ts, batched=True,
+                check_cycle_consistency=self.config['check_cycle_consistency'])
+            batchinf_nd = time.time()  # -- end
+
+            # SQRT of dense certainty
+            dense_certainty = dense_certainty.sqrt()
+
+            # Get sparse matching keypoints
+            getkpts_st = time.time()
+            mkps1, mkps2 = [], []
+            #scentainty = []
+            for idx, tta_elem in enumerate(tta):
+                ith_sparse_matches = self.results_thresholding(dense_matches[idx], dense_certainty[idx])
+                #ith_sparse_matches, ith_centainty = self.results_thresholding(dense_matches[idx], dense_certainty[idx])
+
+                aug_mkps1 = ith_sparse_matches[:, :2]
+                aug_mkps2 = ith_sparse_matches[:, 2:]
+
+                h, w, c = img_bgr_np1.shape
+                aug_mkps1[:, 0] = ((aug_mkps1[:, 0] + 1.) / 2.) * w
+                aug_mkps1[:, 1] = ((aug_mkps1[:, 1] + 1.) / 2.) * h
+
+                h, w, c = img_bgr_np2.shape
+                aug_mkps2[:, 0] = ((aug_mkps2[:, 0] + 1.) / 2.) * w
+                aug_mkps2[:, 1] = ((aug_mkps2[:, 1] + 1.) / 2.) * h
+
+                mkps1.append(aug_mkps1)
+                mkps2.append(aug_mkps2)
+                #scentainty.append（ith_centainty）
+            getkpts_nd = time.time()
+
+            # Reverse TTA
+            revtta_st = time.time()
+            for idx, tta_elem in enumerate(tta):
+                if tta_elem == 'orig':
+                    pass
+                elif tta_elem == 'flip_lr':
+                    mkps1[idx][:, 0] = img_bgr_np1.shape[1] - mkps1[idx][:, 0]
+                    mkps2[idx][:, 0] = img_bgr_np2.shape[1] - mkps2[idx][:, 0]
+                elif tta_elem == 'flip_ud':
+                    mkps1[idx][:, 1] = img_bgr_np1.shape[0] - mkps1[idx][:, 1]
+                    mkps2[idx][:, 1] = img_bgr_np2.shape[0] - mkps2[idx][:, 1]
+                elif tta_elem == 'rot_r10':
+                    mkps1[idx], mask0 = self.tta_rotation_postprocess(mkps1[idx], img_bgr_np1, rot_r10_M0_inv)
+                    mkps2[idx], mask1 = self.tta_rotation_postprocess(mkps2[idx], img_bgr_np2, rot_r10_M1_inv)
+                    mkps1[idx], mkps2[idx] = mkps1[idx][mask0 & mask1], mkps2[idx][mask0 & mask1]
+                elif tta_elem == 'rot_l10':
+                    mkps1[idx], mask0 = self.tta_rotation_postprocess(mkps1[idx], img_bgr_np1, rot_l10_M0_inv)
+                    mkps2[idx], mask1 = self.tta_rotation_postprocess(mkps2[idx], img_bgr_np2, rot_l10_M1_inv)
+                    mkps1[idx], mkps2[idx] = mkps1[idx][mask0 & mask1], mkps2[idx][mask0 & mask1]
+                else:
+                    raise ValueError('Unknown TTA method.')
+            revtta_nd = time.time()
+
+            if verbose >= 1:
+                print('    - DKM inner:')
+                print('      - ttaprep:', ttaprep_nd - ttaprep_st)
+                print('      - batchinf:', batchinf_nd - batchinf_st)
+                print('      - getkpts:', getkpts_nd - getkpts_st)
+                print('      - revtta:', revtta_nd - revtta_st)
+            return np.concatenate(mkps1), np.concatenate(mkps2)
+            #return np.concatenate(mkps1), np.concatenate(mkps2), scentainty
+#########################################  DKM   ########################################################################
+
+#IMC-dataset
+
+import cv2
+
+
+class IMCDataset(torch.utils.data.Dataset):
+    """
+    """
+    def __init__(self, test_csv, img_dir, ext='png', sizes={'orig': {'type': 'orig'}}):
+        """
+        Stores the dataset metadata in following variables:
+          - self.test_samples: a list of rows, each row is represented as tuple:
+                               (sample_id, batch_id, image_1_id, image_2_id)
+          - self.img_dir: top-level directory of images. Each image can be
+                          found at path "<img_dir>/<batch_id>/<img_id>.{png,jpg}
+          - sizes: image scales to prepare. Example:
+                   {name1: {type: longside, longside: 1200},
+                    name2: {type: orig},
+                    name3: {type: targetwh, w: 800, h: 600}}
+        """
+        self.test_samples = []
+        with open(test_csv, 'r') as f:
+            reader = csv.reader(f, delimiter=',')
+            for i, row in enumerate(reader):
+                # Skip header.
+                if i == 0:
+                    continue
+                self.test_samples += [row]
+        self.img_dir = img_dir
+        self.ext = ext
+        self.sizes = sizes
+
+    def __len__(self):
+        return len(self.test_samples)
+
+    def __getitem__(self, idx):
+        """Returns in format:
+        {
+            sample_id: sample_id
+            img0_orig_size: [w0, h0]
+            img1_orig_size: [w1, h1]
+            scales:
+                orig: [img0_orig_scale, img1_orig_scale]
+                ls1200: [img0_with_longside_1200, img1_with_longside_1200]
+        }
+        """
+        row = self.test_samples[idx]
+        sample_id, batch_id, image_1_id, image_2_id = row
+
+        img_np0 = cv2.imread(f'{self.img_dir}/{batch_id}/{image_1_id}.{self.ext}')
+        img_np1 = cv2.imread(f'{self.img_dir}/{batch_id}/{image_2_id}.{self.ext}')
+        assert img_np0 is not None and img_np1 is not None
+
+        ret_dict = {
+            'sample_id': sample_id,
+            'img0_orig_size': [img_np0.shape[1], img_np0.shape[0]],
+            'img1_orig_size': [img_np1.shape[1], img_np1.shape[0]],
+            'scales': {}
+        }
+        for size_name, size_cfg in self.sizes.items():
+            ret_dict['scales'][size_name] = [
+                IMCDataset.process_image(img_np0, size_cfg),
+                IMCDataset.process_image(img_np1, size_cfg),
+            ]
+        return ret_dict
+
+    @staticmethod
+    def process_image(img, size_cfg):
+        if size_cfg['type'] == 'orig':
+            return img
+        elif size_cfg['type'] == 'targetwh':
+            return cv2.resize(
+                img, (size_cfg['w'], size_cfg['h']),
+                interpolation=cv2.INTER_CUBIC)
+        elif size_cfg['type'] == 'longside':
+            scale = float(size_cfg['longside']) / max(img.shape[0], img.shape[1])
+            w = int(img.shape[1] * scale)
+            h = int(img.shape[0] * scale)
+            return cv2.resize(img, (w, h), interpolation=cv2.INTER_CUBIC)
+        elif size_cfg['type'] == 'scalelim':
+            max_scale = float(size_cfg['max_longside']) / max(img.shape[0], img.shape[1])
+            eff_scale = min(float(size_cfg['scale']), max_scale)
+            w = int(img.shape[1] * (size_cfg['scale']))
+            h = int(img.shape[0] * (size_cfg['scale']))
+            return cv2.resize(img, (w, h), interpolation=cv2.INTER_CUBIC)
+
+def get_imc_dataloader(test_csv, img_dir, ext='png', sizes={'orig': {'type': 'orig'}}):
+    imc_dataset = IMCDataset(test_csv, img_dir, ext, sizes)
+    imc_dataloader = torch.utils.data.DataLoader(
+        imc_dataset, batch_size=None, sampler=None, batch_sampler=None,
+        num_workers=1, collate_fn=None, prefetch_factor=4)
+    return imc_dataloader
+
+
+
+
+#####################################################################################################################
+
+#2-stage match
+
+import time
+
+
+class MultiStageMatcher:
+    def __init__(self,
+                 stage1_matchers_cfg,
+                 stage2_matchers_cfg,
+                 crop_roi_method='max_box',
+                 crop_roi_min_side=200,
+                 crop_roi_margin=50,
+                 crop_roi_inliers_only=True,
+                 ):
+        self.stage1_matchers_cfg = stage1_matchers_cfg
+        self.stage2_matchers_cfg = stage2_matchers_cfg
+
+        # Crop Roi config  计算roi区域
+        self.crop_roi_method = crop_roi_method
+        self.crop_roi_min_side = crop_roi_min_side
+        self.crop_roi_margin = crop_roi_margin
+        self.crop_roi_inliers_only = crop_roi_inliers_only
+        assert crop_roi_method in ['max_box', 'prob_3sigma'], "Unknown crop_roi_method"
+
+    def calc_roi_coords(self, w, h, mkpts, margin=40):
+        """
+        mkpts is a list [(x1, y1), (x2, y2), ...],
+        where x is w axis and y is h axis.
+        """
+
+        def wiggle(a, b, minl, bound):
+            """evenly pad a and b so that [a, b) have length minl均匀地填充a和b，使[a, b)的长度为minl"""
+            if b < a:
+                a, b = b, a
+            if minl >= bound:
+                return 0, bound
+            if (b - a) >= minl:
+                return a, b
+            d = (minl - (b - a))
+            pad_l, pad_r = d // 2, d - d // 2
+            na, nb = a - pad_l, b + pad_r
+            if a < 0:
+                a, b = 0, minl
+            if b >= bound:
+                a, b = bound - minl, bound
+            return a, b
+
+        if self.crop_roi_method == 'max_box':
+            left, right = int(np.floor(mkpts[:, 0].min())), int(np.ceil(mkpts[:, 0].max()))
+            top, bottom = int(np.floor(mkpts[:, 1].min())), int(np.ceil(mkpts[:, 1].max()))
+            left, right = wiggle(left, right, self.crop_roi_min_side, w)
+            top, bottom = wiggle(top, bottom, self.crop_roi_min_side, h)
+            left, right = max(0, left - margin), min(right + margin, w)
+            top, bottom = max(0, top - margin), min(bottom + margin, h)
+        return left, right, top, bottom
+
+    def __call__(self, row_dict, verbose=0, ret_ims=False, ext='png'):
+        st = time.time()
+        orig_w0, orig_h0 = row_dict['img0_orig_size']
+        orig_w1, orig_h1 = row_dict['img1_orig_size']
+
+        if len(self.stage2_matchers_cfg) > 0 or ret_ims:
+            img_orig0 = row_dict['scales']['original'][0].numpy()
+            img_orig1 = row_dict['scales']['original'][1].numpy()
+
+        # ---------------------------
+        # STAGE 1
+        # ---------------------------
+        max_name_len = 0
+        stage1_incl_final_mkpts0, stage1_incl_final_mkpts1 = [], []
+        stage1_mkpts0, stage1_mkpts1, runtime_str, kp_count_str = [], [], [], []
+        for m_cfg in self.stage1_matchers_cfg:
+            max_name_len = max(len(m_cfg['name']), max_name_len)
+
+            # Inference
+            m_st = time.time()
+            img0, img1 = row_dict['scales'][m_cfg['input_key']]
+
+            # HACK: CONVERT BACK TO NUMPY ARRAY FOR FURTHER AUGS!!!!
+            if torch.is_tensor(img0):
+                img0 = img0.numpy()
+            if torch.is_tensor(img1):
+                img1 = img1.numpy()
+            row_dict['scales'][m_cfg['input_key']] = [img0, img1]
+
+            m_mkpts0, m_mkpts1 = m_cfg['fn'](img0, img1, tta=m_cfg['tta'])
+
+            # Scale back
+            scale0_w, scale0_h = float(img0.shape[1] / orig_w0), float(img0.shape[0] / orig_h0)
+            scale1_w, scale1_h = float(img1.shape[1] / orig_w1), float(img1.shape[0] / orig_h1)
+            m_mkpts0[:, 0] /= scale0_w
+            m_mkpts0[:, 1] /= scale0_h
+            m_mkpts1[:, 0] /= scale1_w
+            m_mkpts1[:, 1] /= scale1_h
+            m_nd = time.time()
+
+            if m_cfg['use_for_roi']:
+                stage1_mkpts0.append(m_mkpts0)
+                stage1_mkpts1.append(m_mkpts1)
+            if m_cfg['use_for_final']:
+                stage1_incl_final_mkpts0.append(m_mkpts0)
+                stage1_incl_final_mkpts1.append(m_mkpts1)
+            runtime_str.append(f'(stage 1) {m_cfg["name"].ljust(max_name_len)}: {m_nd - m_st:06f}s')
+            kp_count_str.append(f'(stage_1) {m_cfg["name"]}={len(m_mkpts0)}')
+
+        stage1_mkpts0 = np.concatenate(stage1_mkpts0)
+        stage1_mkpts1 = np.concatenate(stage1_mkpts1)
+
+        # ---------------------------
+        # CROP ROI AND PREPARE STAGE 2
+        # ---------------------------
+
+        # quick inlier find
+        roi_st = time.time()
+        if len(self.stage2_matchers_cfg) > 0:
+            if self.crop_roi_inliers_only:
+                stage1_F, stage1_inliers = cv2.findFundamentalMat(
+                    stage1_mkpts0, stage1_mkpts1, cv2.USAC_MAGSAC, 0.5, 0.999, 1000)
+                stage1_inlier_mask = np.array(
+                    [i[0] == 1 for i in stage1_inliers], dtype=np.bool)
+                stage1_mkpts0_inliers = stage1_mkpts0[stage1_inlier_mask]
+                stage1_mkpts1_inliers = stage1_mkpts1[stage1_inlier_mask]
+
+            roi_left0, roi_right0, roi_top0, roi_bottom0 = self.calc_roi_coords(
+                orig_w0, orig_h0, stage1_mkpts0_inliers, margin=self.crop_roi_margin)
+            roi_left1, roi_right1, roi_top1, roi_bottom1 = self.calc_roi_coords(
+                orig_w1, orig_h1, stage1_mkpts1_inliers, margin=self.crop_roi_margin)
+            stage2_img0 = img_orig0[roi_top0:roi_bottom0, roi_left0:roi_right0].copy()
+            stage2_img1 = img_orig1[roi_top1:roi_bottom1, roi_left1:roi_right1].copy()
+        roi_nd = time.time()
+
+        # ---------------------------
+        # STAGE 2
+        # ---------------------------
+        stage2_mkpts0, stage2_mkpts1 = [], []
+        for m_cfg in self.stage2_matchers_cfg:
+            # Inference
+            m_st = time.time()
+            img0 = IMCDataset.process_image(stage2_img0, m_cfg['resize'])
+            img1 = IMCDataset.process_image(stage2_img1, m_cfg['resize'])
+            m_mkpts0, m_mkpts1 = m_cfg['fn'](img0, img1, tta=m_cfg['tta'])
+
+            # Scale back
+            scale0_w = float(img0.shape[1] / (roi_right0 - roi_left0))
+            scale0_h = float(img0.shape[0] / (roi_bottom0 - roi_top0))
+            scale1_w = float(img1.shape[1] / (roi_right1 - roi_left1))
+            scale1_h = float(img1.shape[0] / (roi_bottom1 - roi_top1))
+            m_mkpts0[:, 0] = float(roi_left0) + m_mkpts0[:, 0] / scale0_w
+            m_mkpts0[:, 1] = float(roi_top0) + m_mkpts0[:, 1] / scale0_h
+            m_mkpts1[:, 0] = float(roi_left1) + m_mkpts1[:, 0] / scale1_w
+            m_mkpts1[:, 1] = float(roi_top1) + m_mkpts1[:, 1] / scale1_h
+            m_nd = time.time()
+
+            stage2_mkpts0.append(m_mkpts0)
+            stage2_mkpts1.append(m_mkpts1)
+            runtime_str.append(f'(stage 2) {m_cfg["name"].ljust(max_name_len)}: {m_nd - m_st:06f}s')
+            kp_count_str.append(f'(stage 2) {m_cfg["name"]}={len(m_mkpts0)}')
+
+        mkpts0 = np.concatenate(stage1_incl_final_mkpts0 + stage2_mkpts0)
+        mkpts1 = np.concatenate(stage1_incl_final_mkpts1 + stage2_mkpts1)
+
+        if verbose >= 1:
+            print("  - Matching:")
+            for s in runtime_str:
+                print("    -", s)
+            print(f"  - Stage 2 prep: {roi_nd - roi_st:06f}s")
+            print("  - Keypoints:", len(mkpts0), '|', ', '.join(kp_count_str))
+        if ret_ims:
+            if len(self.stage2_matchers_cfg) > 0:
+                cv2.rectangle(img_orig0, (roi_left0, roi_top0), (roi_right0, roi_bottom0), (0, 0, 255), 3)
+                cv2.rectangle(img_orig1, (roi_left1, roi_top1), (roi_right1, roi_bottom1), (0, 0, 255), 3)
+            return mkpts0, mkpts1, img_orig0, img_orig1
+        else:
+            return mkpts0, mkpts1
+
+
+class SolutionHolder:
+    def __init__(self):
+        self.F_dict = dict()
+
+    @staticmethod
+    def solve_keypoints(mkpts0, mkpts1, verbose=0, ret_inliers=False):
+        findmat_st = time.time()
+        if len(mkpts0) > 7:
+            # F, inliers = cv2.findFundamentalMat(mkpts0, mkpts1, cv2.USAC_MAGSAC, 0.25, 0.9999, 100000)
+            F, inliers = cv2.findFundamentalMat(mkpts0, mkpts1, cv2.USAC_MAGSAC, 0.2, 0.9999,
+                                                150000)  # EDITED, was 220000
+            inliers = inliers > 0
+            assert F.shape == (3, 3), 'Malformed F?'
+        else:
+            F = np.zeros((3, 3))
+        findmat_end = time.time()
+        if verbose >= 1:
+            print('  - Ransac time:', findmat_end - findmat_st, "s")
+        if ret_inliers:
+            return F, inliers
+        else:
+            return F
+
+    @staticmethod
+    def flatten_matrix(M, num_digits=8):
+        '''Convenience function to write CSV files.'''
+        return ' '.join([f'{v:.{num_digits}e}' for v in M.flatten()])
+
+    def add_solution(self, sample_id, mkpts0, mkpts1, verbose=0):
+        self.F_dict[sample_id] = SolutionHolder.solve_keypoints(mkpts0, mkpts1, verbose)
+
+    def dump(self, output_file):
+        with open(output_file, 'w') as f:
+            f.write('sample_id,fundamental_matrix\n')
+            for sample_id, F in self.F_dict.items():
+                f.write(f'{sample_id},{SolutionHolder.flatten_matrix(F)}\n')
+
+
+######################################################################################################################
+
+#initialize
+
+# -------------------------------------------------
+#  Base Matchers
+# -------------------------------------------------
+superglue_matcher = SuperGlueMatcher(device=device)
+loftr_matcher = LoFTRMatcher(device=device)
+
+abs_config = {
+    'w': 640, 'h': 640, 'check_cycle_consistency': False,
+    'thresh': {'method': 'abs', 'th': 0.8, 'take': 120}
+}
+dkm_matcher = DKMMatcher(device=device, config=abs_config)
+
+from functools import partial
+
+# -------------------------------------------------
+# DATALOADER
+#
+# the "sizes" should include keys as required by
+# uber_matcher below
+# -------------------------------------------------
+test_src = '/kaggle/input/image-matching-challenge-2022/'
+imc_dataloader = get_imc_dataloader(
+    test_csv=f'{test_src}/test.csv',
+    img_dir=f'{test_src}/test_images',
+    sizes={
+        'original': {'type': 'orig'},
+        'ls840': {'type': 'longside', 'longside': 840},
+        'ls1200': {'type': 'longside', 'longside': 1200},
+        'ls1600': {'type': 'longside', 'longside': 1600},
+        # '800x600': {'type': 'targetwh', 'w': 800, 'h': 600},
+    })
+
+# -------------------------------------------------
+#  Uber Matcher
+# -------------------------------------------------
+
+uber_matcher = MultiStageMatcher(
+    stage1_matchers_cfg=[
+        {
+            'name': 'loftr',
+            'input_key': 'ls1200',
+            'fn': partial(loftr_matcher, conf_th=0.3),
+            'tta': ['orig', ],
+            'use_for_roi': True,
+            'use_for_final': True,
+        },
+        {
+            'name': 'superglue',
+            'input_key': 'ls1600',
+            'fn': partial(superglue_matcher, conf_th=0.4),
+            'tta': ['orig', 'flip_lr', 'rot_r10', 'rot_l10'],
+            'use_for_roi': True,
+            'use_for_final': True,
+        },
+        # {
+        #     'name': 'dkm',
+        #     'fn': dkm_matcher,
+        #     'input_key': '800x600',
+        #     'tta': ['orig', 'flip_lr', 'rot_r10'],
+        #     'use_for_roi': False,
+        #     'use_for_final': True,
+        # },
+    ],
+    stage2_matchers_cfg=[
+        {
+            'name': 'loftr',
+            'fn': partial(loftr_matcher, conf_th=0.3),
+            'resize': {'type': 'scalelim', 'max_longside': 1200, 'scale': 2.0},
+            'tta': ['orig', ],
+        },
+        # {
+        #     'name': 'superglue',
+        #     'fn': partial(superglue_matcher, conf_th=0.4),
+        #     'resize': {'type': 'scalelim', 'max_longside': 1400, 'scale': 2.0},
+        #     'tta': ['orig', 'flip_lr', ]
+        # },
+        # {
+        #     'name': 'superglue',
+        #     'fn': superglue_matcher,
+        #     'resize': {'type': 'longside', 'longside': 1200},
+        #     'tta': ['orig', 'flip_lr', ]
+        # },
+        {
+            'name': 'dkm',
+            'fn': dkm_matcher,
+            'resize': {'type': 'targetwh', 'w': 640, 'h': 640},
+            'tta': ['orig', 'flip_lr', 'rot_r10']
+        },
+    ],
+    crop_roi_min_side=200,
+    crop_roi_margin=20,
+)
+
+########################################################################################################################
+
+#vis
+
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+VISUALIZE = True
+import time
+
+
+
+if VISUALIZE and len(imc_dataloader) == 3:
+    for i, row_dict in enumerate(imc_dataloader):
+        st = time.time()
+
+        mkpts0, mkpts1, img_np1, img_np2 = uber_matcher(row_dict, verbose=1, ret_ims=True)
+        F, inliers = SolutionHolder.solve_keypoints(mkpts0, mkpts1, verbose=1, ret_inliers=True)
+
+        gc_st = time.time()
+        gc.collect()
+        nd = time.time()
+        if (i < 3):
+            print("  - gc:", nd - gc_st, "s")
+            print("Running time: ", nd - st, " s")
+            print("Num inliers:", sum(p[0] for p in inliers))
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            KMF.draw_LAF_matches(
+                KF.laf_from_center_scale_ori(torch.from_numpy(mkpts0).view(1,-1, 2),
+                                             torch.ones(mkpts0.shape[0]).view(1,-1, 1, 1),
+                                             torch.ones(mkpts0.shape[0]).view(1,-1, 1)),
+
+                KF.laf_from_center_scale_ori(torch.from_numpy(mkpts1).view(1,-1, 2),
+                                             torch.ones(mkpts1.shape[0]).view(1,-1, 1, 1),
+                                             torch.ones(mkpts1.shape[0]).view(1,-1, 1)),
+                torch.arange(mkpts0.shape[0]).view(-1,1).repeat(1,2),
+                cv2.cvtColor(img_np1, cv2.COLOR_BGR2RGB),
+                cv2.cvtColor(img_np2, cv2.COLOR_BGR2RGB),
+                inliers,
+                draw_dict={'inlier_color': (0.2, 1, 0.2),
+                           'tentative_color': None,
+                           'feature_color': (0.2, 0.5, 1), 'vertical': False},
+            )
+
+gc.collect()
+
+######################################################################################################################3
+
+#output
+
+import time
+import threading
+
+
+def main_solution(output_file):
+    # Prepare variables
+    solution_holder = SolutionHolder()
+    mkpts0, mkpts1 = None, None
+    mat_calc_thread = None
+
+    for i, row_dict in enumerate(imc_dataloader):
+        sample_st = time.time()
+
+        # Print stats only for the first 3 samples
+        verbose = 1 if i < 3 else 0
+
+        # Parse row
+        sample_id = row_dict['sample_id']
+        cyc_st = time.time()
+
+        # Delete previous sample's results
+        del mkpts0
+        del mkpts1
+
+        # Calculate matching pairs
+        mkpts0, mkpts1 = uber_matcher(row_dict, verbose=1)
+
+        # If the RANSAC thread is not finished (it should though), wait...
+        if mat_calc_thread is not None:
+            mat_calc_thread.join()
+
+        # Execute a RANSAC thread
+        mat_calc_thread = threading.Thread(
+            target=solution_holder.add_solution,
+            args=(sample_id, mkpts0, mkpts1, verbose))
+        mat_calc_thread.start()
+
+        # Collect garbage and print logs if required
+        cyc_end = time.time()
+        gc_st = time.time()
+        gc.collect()
+        gc_end = time.time()
+        if verbose > 0:
+            print(
+                f'({i + 1}/{len(imc_dataloader)})  Iter total: {gc_end - cyc_st:.06f}s  (runtime: {cyc_end - cyc_st:.06f}s, gc: {gc_end - gc_st:.06f}s)')
+        else:
+            print(f'({i + 1}/{len(imc_dataloader)})  {time.time() - sample_st}s')
+
+    # Finish and write solution
+    fin_st = time.time()
+    if mat_calc_thread is not None:
+        mat_calc_thread.join()
+    fin_end = time.time()
+
+    if verbose > 0:
+        print('Final calc:', fin_end - fin_st, 's')
+    solution_holder.dump(output_file)
